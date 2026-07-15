@@ -1,0 +1,169 @@
+name: build
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "[0-9]*"
+  workflow_dispatch:
+    inputs:
+      gawk_version:
+        description: "gawk version to build from ftp.gnu.org (e.g. 3.1.8). Defaults to the contents of GAWK_VERSION."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and release gawk.exe (MinGW-w64)
+    runs-on: windows-latest
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Resolve gawk version
+        id: resolve
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.gawk_version }}
+        run: |
+          set -euo pipefail
+          VERSION="${INPUT_VERSION:-}"
+          if [ -z "$VERSION" ]; then
+            if [ ! -f GAWK_VERSION ]; then
+              echo "::error::GAWK_VERSION file not found in repository root"
+              exit 1
+            fi
+            VERSION="$(tr -d ' \t\r\n' < GAWK_VERSION)"
+          fi
+          VERSION="${VERSION#v}"
+          if [ -z "$VERSION" ]; then
+            echo "::error::No gawk version given (GAWK_VERSION file is empty)"
+            exit 1
+          fi
+
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            RELEASE_TAG="$GITHUB_REF_NAME"
+            # Guard against tagging a release whose GAWK_VERSION file was not updated
+            PUSHED="${RELEASE_TAG#v}"
+            case "$PUSHED" in
+              "$VERSION"*) ;;
+              *)
+                echo "::error::Pushed tag '$RELEASE_TAG' does not match GAWK_VERSION file contents '$VERSION'. Update GAWK_VERSION in the tagged commit, or push a matching tag."
+                exit 1
+                ;;
+            esac
+          else
+            RELEASE_TAG="v$VERSION"
+          fi
+
+          echo "Building gawk $VERSION (release tag: $RELEASE_TAG)"
+          {
+            echo "version=$VERSION"
+            echo "release_tag=$RELEASE_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up MSYS2 / MinGW-w64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: make mingw-w64-x86_64-gcc
+
+      - name: Fetch gawk source from ftp.gnu.org
+        shell: msys2 {0}
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "gawk-$VERSION.tar.gz" \
+            "https://ftp.gnu.org/gnu/gawk/gawk-$VERSION.tar.gz"
+          tar xzf "gawk-$VERSION.tar.gz"
+
+      - name: Build gawk.exe
+        shell: msys2 {0}
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd "gawk-$VERSION"
+          # The DOS/Windows port lives in pc/: copy its files (except its
+          # ChangeLog) into the source root, per README_d/README.pc.
+          find pc -maxdepth 1 -type f ! -name ChangeLog -exec cp {} . \;
+          # MinGW has no <langinfo.h>; the old GnuWin32 builds got it from
+          # LibGw32C. Use our minimal shim instead.
+          cp ../shim/langinfo.h .
+          # This is the Makefile's mingw32 target expanded, with extra CFLAGS:
+          # GCC >= 14 defaults to C23 and treats this 2010 codebase's idioms
+          # (implicit declarations, K&R-isms, loose pointer conversions) as
+          # hard errors, so build it as gnu89 with those diagnostics relaxed.
+          make all \
+            CC=gcc O=.o \
+            CF="-O2 -gdwarf-2 -g3 -std=gnu89 -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-return-mismatch" \
+            OBJ=popen.o LNK=LMINGW32 PLNK=PLMINGW32 \
+            LF="-gdwarf-2 -g3" LF2=-lmsvcp60 RSP=
+
+      - name: Smoke test
+        shell: msys2 {0}
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd "gawk-$VERSION"
+          ./gawk.exe --version
+          test "$(echo 'hello world' | ./gawk.exe '{ print toupper($2), 1+2 }')" = "WORLD 3"
+          # Must be a native binary: only Windows system DLLs allowed.
+          objdump -p gawk.exe | grep 'DLL Name'
+          if objdump -p gawk.exe | grep -Ei 'cygwin|msys' ; then
+            echo "::error::gawk.exe depends on a non-native runtime DLL"
+            exit 1
+          fi
+
+      - name: Package
+        shell: msys2 {0}
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd "gawk-$VERSION"
+          strip gawk.exe pgawk.exe
+          mkdir ../dist
+          cp gawk.exe pgawk.exe COPYING ../dist/
+          cd ../dist
+          sha256sum gawk.exe pgawk.exe COPYING > sha256sums.txt
+          cat sha256sums.txt
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.resolve.outputs.release_tag }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          ASSETS=(dist/gawk.exe dist/pgawk.exe dist/COPYING dist/sha256sums.txt)
+
+          {
+            echo "GNU awk **$VERSION** for Windows (x86-64), built from [ftp.gnu.org/gnu/gawk/gawk-$VERSION.tar.gz](https://ftp.gnu.org/gnu/gawk/gawk-$VERSION.tar.gz) with MinGW-w64 GCC (\`make mingw32\` from the tarball's \`pc/\` port)."
+            echo
+            echo "Native win32 binaries — no Cygwin/MSYS layer. Runtime dependencies are Windows system DLLs only (\`kernel32.dll\`, \`msvcrt.dll\`, \`msvcp60.dll\`)."
+            echo
+            echo "- \`gawk.exe\` — GNU awk"
+            echo "- \`pgawk.exe\` — profiling GNU awk"
+            echo "- \`COPYING\` — license (GPL), from the source tarball"
+            echo "- \`sha256sums.txt\`"
+          } > notes.md
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; replacing assets"
+            gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber "${ASSETS[@]}"
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "gawk $VERSION for Windows" \
+              --notes-file notes.md \
+              "${ASSETS[@]}"
+          fi
